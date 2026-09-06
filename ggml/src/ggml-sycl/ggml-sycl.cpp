@@ -3218,8 +3218,15 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                         scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
                                                              /*num_src=*/2, " : converting src1 to Q8_1");
                         try {
-                            quantize_row_q8_1_sycl<quantize_q8_1>(src1_ddf_i, src1_ddq_i, ne10, src1_ncols,
-                                                                  src1_padded_col_size, stream);
+                            if constexpr (std::is_same_v<quantize_f<QK8_1 / WARP_SIZE>,
+                                                         quantize_tq3_4s_q8_1<QK8_1 / WARP_SIZE>>) {
+                                // A copied/non-contiguous activation needs the same RHT as a contiguous one.
+                                quantize_row_q8_1_sycl<quantize_tq3_4s_q8_1>(src1_ddf_i, src1_ddq_i, ne10,
+                                                                          src1_ncols, src1_padded_col_size, stream);
+                            } else {
+                                quantize_row_q8_1_sycl<quantize_q8_1>(src1_ddf_i, src1_ddq_i, ne10, src1_ncols,
+                                                                   src1_padded_col_size, stream);
+                            }
                         } catch (const sycl::exception & exc) {
                             std::cerr << "Quantize_row_q8_1_sycl error" << exc.what()
                                       << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
@@ -4402,8 +4409,29 @@ static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * 
            src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 }
 
+static bool can_use_tq3_4s_mmvq(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    // Milestone 1: dense, single-device weights. Any number of activation
+    // columns is evaluated by repeated GEMV, without a dequantized weight copy.
+    return src0->type == GGML_TYPE_TQ3_4S && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+           ggml_is_contiguous(src0) && src0->ne[0] % ggml_sycl_tq3_4s::qk == 0 &&
+           src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+           src1->nb[0] == sizeof(float) &&
+           (!src0->buffer || !ggml_backend_buffer_is_sycl_split(src0->buffer));
+}
+
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
+    if (src0->type == GGML_TYPE_TQ3_4S) {
+        GGML_ASSERT(can_use_tq3_4s_mmvq(src0, src1, dst));
+        GGML_ASSERT(ctx.stream()->get_device().is_gpu());
+        static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+        if (g_ggml_sycl_debug && !logged.test_and_set()) {
+            GGML_SYCL_DEBUG("TQ3_4S -> SYCL MMVQ (CPU-reference RHT + Q8_1, native GPU unpack)\n");
+        }
+        // Keep this before DMMV/oneMKL/reorder selection, including for prefill.
+        ggml_sycl_op_mul_mat<quantize_tq3_4s_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
+        return;
+    }
     const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
     int64_t min_compute_capability = INT_MAX;
 
@@ -5734,6 +5762,14 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
 
                 ggml_type src0_type = op->src[0]->type;
 
+                if (src0_type == GGML_TYPE_TQ3_4S) {
+                    const auto & sycl_device = dpct::dev_mgr::instance().get_device(device);
+                    const auto sizes = sycl_device.get_info<sycl::info::device::sub_group_sizes>();
+                    return op->op == GGML_OP_MUL_MAT && can_use_tq3_4s_mmvq(a, b, op) &&
+                           sycl_device.is_gpu() && sycl_device.has(sycl::aspect::fp16) &&
+                           std::find(sizes.begin(), sizes.end(), WARP_SIZE) != sizes.end();
+                }
+
                 // TODO: The configuration below needs more work to be supported with oneDNN
                 if (ggml_is_permuted(a) && !ggml_is_contiguous(a) &&
                     a->ne[2] > 1 && a->ne[3] > 1 && src0_type == GGML_TYPE_F16) {
@@ -6077,6 +6113,10 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 }
 
 static bool ggml_backend_sycl_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    if (op->op == GGML_OP_MUL_MAT && op->src[0]->type == GGML_TYPE_TQ3_4S) {
+        // A single decode column must not be excluded by the generic batch threshold.
+        return do_ggml_backend_sycl_device_supports_op(dev, op);
+    }
     ggml_backend_sycl_device_context * sycl_ctx = (ggml_backend_sycl_device_context *)dev->context;
     return get_op_batch_size(op) >= sycl_ctx->op_offload_min_batch_size;
 }

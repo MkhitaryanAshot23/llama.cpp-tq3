@@ -2122,6 +2122,19 @@ static void mul_mat_vec_iq4_xs_q8_1_sycl_switch_ncols(
     }
 }
 
+static void mul_mat_vec_tq3_4s_q8_1_sycl(
+        const void * vx, const void * vy, float * dst, const int ncols, const int nrows,
+        dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % ggml_sycl_tq3_4s::qk == 0);
+    const sycl::range<3> blocks(1, 1, (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y);
+    const sycl::range<3> threads(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    stream->parallel_for(sycl::nd_range<3>(blocks * threads, threads),
+        [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            mul_mat_vec_q<ggml_sycl_tq3_4s::qk, ggml_sycl_tq3_4s::qi, block_tq3_4s,
+                          ggml_sycl_tq3_4s::vdr, vec_dot_tq3_4s_q8_1>(vx, vy, dst, ncols, nrows, item);
+        });
+}
+
 void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                                 ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
                                 const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low,
@@ -2145,6 +2158,10 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
         const char * src1_ddq_i_bs     = src1_ddq_i + src1_ddq_i_offset;
         float *      dst_dd_i_bs       = dst_dd_i + i * dst->ne[0];
         switch (src0->type) {
+            case GGML_TYPE_TQ3_4S:
+                // One native GEMV per column, including batches larger than MMVQ_MAX_BATCH_SIZE.
+                mul_mat_vec_tq3_4s_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                break;
             case GGML_TYPE_Q4_0:
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                     ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {

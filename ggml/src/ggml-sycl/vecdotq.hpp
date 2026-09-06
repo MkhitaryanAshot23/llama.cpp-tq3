@@ -17,9 +17,18 @@
 #include "ggml.h"
 #include "type.hpp"
 #include "quants.hpp"
+#include "tq3_4s.hpp"
 
 typedef float (*vec_dot_q_sycl_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
                                   const int & iqs);
+
+static __dpct_inline__ float vec_dot_tq3_4s_q8_1(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+    const auto * bq = static_cast<const block_tq3_4s *>(vbq);
+    static_assert(sizeof(block_tq3_4s) == 16 && QK8_1 == ggml_sycl_tq3_4s::qk);
+    const int group = iqs / ggml_sycl_tq3_4s::vdr;
+    return ggml_sycl_tq3_4s::dot_group(bq->d, bq->qs, bq8_1->qs, group) * float(bq8_1->ds[0]);
+}
 
 static __dpct_inline__ int get_int_b1(const void * x, const int & i32) {
     const uint8_t * x8 = (const uint8_t *) x;
