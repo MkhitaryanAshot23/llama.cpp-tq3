@@ -1223,9 +1223,20 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         int * cur_backend_id = &tensor_backend_id(node);
-        if (node->view_src != NULL && *cur_backend_id == -1) {
-            *cur_backend_id = tensor_backend_id(node->view_src);
-            SET_CAUSE(node, "4.vsrc");
+        if (node->view_src != NULL) {
+            const int view_backend_id = tensor_backend_id(node->view_src);
+            // In-place operations write into view_src, even if expansion assigned
+            // the operation to a different backend. Copying their inputs at a split
+            // does not move this output alias (e.g. SET in chunked delta net).
+            if (view_backend_id != -1 && (*cur_backend_id == -1 ||
+                    !ggml_backend_sched_buffer_supported(sched, node->view_src, *cur_backend_id))) {
+                if (!ggml_backend_supports_op(sched->backends[view_backend_id], node)) {
+                    GGML_ABORT("in-place operation %s (%s) is not supported by the backend of its destination (%s)",
+                        node->name, ggml_op_name(node->op), ggml_backend_name(sched->backends[view_backend_id]));
+                }
+                *cur_backend_id = view_backend_id;
+                SET_CAUSE(node, "4.vsrc");
+            }
         }
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             struct ggml_tensor * src = node->src[j];

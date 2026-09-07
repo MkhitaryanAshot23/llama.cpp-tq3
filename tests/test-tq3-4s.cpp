@@ -189,6 +189,95 @@ static void random_weights(std::mt19937 & rng, std::vector<block_tq3_4s> & w) {
 }
 
 #ifdef TEST_TQ3_4S_SYCL
+// Reproduce the placement that chunked delta net can acquire with op-offload:
+// GPU matmul -> in-place SET, with a CPU update and a strided CPU consumer.
+// Expansion initially places SET on CPU; its output still aliases the GPU matmul.
+static void test_scheduler(ggml_backend_t gpu, int cols) {
+    auto cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    check(cpu != nullptr, "scheduler CPU backend");
+    auto * ctx = ggml_init({ggml_tensor_overhead() * 32 + ggml_graph_overhead(), nullptr, true});
+    check(ctx != nullptr, "scheduler context");
+    auto * weights_ctx = ggml_init({ggml_tensor_overhead(), nullptr, true});
+    auto * inputs_ctx = ggml_init({ggml_tensor_overhead() * 2, nullptr, true});
+    check(weights_ctx && inputs_ctx, "persistent input contexts");
+    constexpr int k = 96, rows = 64, width = 32, offset = 8;
+    auto * w = ggml_new_tensor_2d(weights_ctx, GGML_TYPE_TQ3_4S, k, rows);
+    auto * x = ggml_new_tensor_2d(inputs_ctx, GGML_TYPE_F32, k, cols);
+    auto * u = ggml_new_tensor_2d(inputs_ctx, GGML_TYPE_F32, width, cols);
+    // Scheduler-owned INPUT storage can be reused after its last consumer.
+    // External buffers model persistent weights/inputs and permit repeated
+    // execution without restoring data or hiding unintended input writes.
+    auto weights_buffer = ggml_backend_alloc_ctx_tensors(weights_ctx, gpu);
+    auto inputs_buffer = ggml_backend_alloc_ctx_tensors(inputs_ctx, cpu);
+    check(weights_buffer && inputs_buffer, "persistent input allocation");
+    ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_set_input(x);
+    ggml_set_input(u);
+    auto * v = ggml_mul_mat(ctx, w, x);
+    auto * update = ggml_scale(ctx, u, 2.0f);
+    auto * set = ggml_set_inplace(ctx, v, update, v->nb[1], v->nb[2], v->nb[3], offset * sizeof(float));
+    auto * view = ggml_view_2d(ctx, set, rows - 1, cols, set->nb[1], sizeof(float));
+    auto * out = ggml_cont(ctx, view);
+    ggml_set_name(v, "scheduler_tq3_matmul");
+    ggml_set_name(set, "scheduler_inplace_set");
+    ggml_set_output(out);
+    auto * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, out);
+    ggml_backend_t backends[] = {gpu, cpu};
+    auto sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    check(sched != nullptr, "scheduler allocation");
+    ggml_backend_sched_set_tensor_backend(sched, update, cpu);
+    ggml_backend_sched_set_tensor_backend(sched, out, cpu);
+    check(ggml_backend_sched_alloc_graph(sched, graph), "mixed graph allocation");
+    check(ggml_backend_sched_get_tensor_backend(sched, v) == gpu, "TQ3 matmul must stay on GPU");
+    check(ggml_backend_sched_get_tensor_backend(sched, set) == gpu, "in-place SET must follow destination buffer");
+    check(ggml_backend_sched_get_tensor_backend(sched, out) == cpu, "strided result must cross to CPU");
+    check(set->data == v->data && set->buffer == v->buffer, "SET output aliases destination");
+    std::mt19937 rng(2026 + cols);
+    std::vector<block_tq3_4s> weights(rows * k / 32);
+    random_weights(rng, weights);
+    std::vector<float> input(k * cols), updates(width * cols), output((rows - 1) * cols);
+    std::normal_distribution<float> normal;
+    for (auto & f : input) { f = normal(rng); }
+    for (auto & f : updates) { f = normal(rng); }
+    ggml_backend_tensor_set(w, weights.data(), 0, weights.size() * sizeof(block_tq3_4s));
+    ggml_backend_tensor_set(x, input.data(), 0, input.size() * sizeof(float));
+    ggml_backend_tensor_set(u, updates.data(), 0, updates.size() * sizeof(float));
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        check(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS, "mixed graph compute");
+        ggml_backend_tensor_get(out, output.data(), 0, output.size() * sizeof(float));
+        std::vector<block_tq3_4s> saved_w(weights.size());
+        std::vector<float> saved_x(input.size()), saved_u(updates.size());
+        ggml_backend_tensor_get(w, saved_w.data(), 0, saved_w.size() * sizeof(block_tq3_4s));
+        ggml_backend_tensor_get(x, saved_x.data(), 0, saved_x.size() * sizeof(float));
+        ggml_backend_tensor_get(u, saved_u.data(), 0, saved_u.size() * sizeof(float));
+        check(std::memcmp(saved_w.data(), weights.data(), weights.size() * sizeof(block_tq3_4s)) == 0,
+              "mixed graph must preserve packed weights");
+        check(saved_x == input && saved_u == updates, "mixed graph must preserve persistent inputs");
+        for (int c = 0; c < cols; ++c) {
+            for (int r = 1; r < rows; ++r) {
+                const auto ref = reference_dot(weights.data() + r * k / 32, input.data() + c * k, k);
+                const double expected = r >= offset && r < offset + width ?
+                    2.0 * updates[c * width + r - offset] : ref.quantized;
+                if (std::abs(output[c * (rows - 1) + r - 1] - expected) > 2e-5 * std::max(1.0, ref.magnitude)) {
+                    std::fprintf(stderr, "scheduler mismatch repeat=%d col=%d row=%d\n", repeat, c, r);
+                }
+                close(output[c * (rows - 1) + r - 1], expected,
+                      2e-5 * std::max(1.0, ref.magnitude), "mixed graph SET and GPU matmul result");
+            }
+        }
+    }
+    std::printf("PASS SYCL scheduler TQ3 -> in-place SET -> strided CPU transfer, cols=%d, splits=%d\n",
+                cols, ggml_backend_sched_get_n_splits(sched));
+    ggml_backend_sched_free(sched);
+    ggml_free(ctx);
+    ggml_backend_buffer_free(inputs_buffer);
+    ggml_backend_buffer_free(weights_buffer);
+    ggml_free(inputs_ctx);
+    ggml_free(weights_ctx);
+    ggml_backend_free(cpu);
+}
+
 static void test_capabilities(ggml_backend_t backend) {
     auto * ctx = ggml_init({ggml_tensor_overhead() * 32, nullptr, true});
     check(ctx != nullptr, "capability test context");
@@ -310,6 +399,8 @@ int main(int argc, char ** argv) {
     check(backend != nullptr, "SYCL backend initialization");
     std::printf("Testing %s: %s\n", ggml_backend_dev_name(device), ggml_backend_dev_description(device));
     test_capabilities(backend);
+    test_scheduler(backend, 3);
+    test_scheduler(backend, 65);
     for (unsigned seed : {1u, 42u, 2026u, 0xdeadbeefu}) {
         std::mt19937 rng(seed);
         for (int k : {32, 96, 256, 544, 4096}) {
