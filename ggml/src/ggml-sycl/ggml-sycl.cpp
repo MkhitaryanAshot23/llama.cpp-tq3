@@ -4430,6 +4430,20 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         }
         // Keep this before DMMV/oneMKL/reorder selection, including for prefill.
         ggml_sycl_op_mul_mat<quantize_tq3_4s_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
+        // Opt-in, bounded dispatch evidence for full-model scheduler diagnostics.
+        // Separate counters keep decode visible after a large prefill/warmup.
+        static const bool trace = ggml_sycl_get_env("GGML_SYCL_TQ3_TRACE", 0) != 0;
+        if (trace) {
+            static std::atomic<uint64_t> calls[2] = {};
+            const int phase = src1->ne[1] == 1 ? 0 : 1;
+            const uint64_t count = calls[phase].fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((count & (count - 1)) == 0) {
+                GGML_LOG_INFO("SYCL TQ3_4S MMVQ: device=%d phase=%s calls=%" PRIu64
+                              " K=%" PRId64 " rows=%" PRId64 " ncols=%" PRId64 " weights=%s\n",
+                              ctx.device, phase == 0 ? "decode" : "prefill", count,
+                              src0->ne[0], src0->ne[1], src1->ne[1], src0->name);
+            }
+        }
         return;
     }
     const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);

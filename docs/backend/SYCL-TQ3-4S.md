@@ -182,7 +182,9 @@ Without a compiler:
 python tests/test-tq3-4s-math.py
 ```
 
-## Development environment record (2026-09-07)
+## Initial development environment record (2026-09-07)
+
+This historical record is superseded by the hardware validation below.
 
 - Working branch: `tq3-sycl-b580`, based on local `origin/main` at `47635d7`.
   The initial unborn branch was attached to this commit with the working
@@ -201,7 +203,61 @@ python tests/test-tq3-4s-math.py
 - No GGUF was searched for, downloaded, created, converted, or executed. The
   future Qwen3.8-27B-TQ3_4S-v2 model remains unvalidated.
 
-The next step is a real toolchain build and these model-free GPU tests. Only
-after correctness is confirmed should performance work consider reusing weight
-loads across columns, reducing launch overhead, or a suitable GEMM path.
-Any int8 optimization must first preserve the chosen codebook contract.
+## Full-model SYCL validation
+
+The existing Windows oneAPI/Visual Studio installation was subsequently available.
+The `build-tq3-sycl-b580` Release build has `GGML_SYCL=ON` and
+`GGML_SYCL_TARGET=INTEL`. Building `test-tq3-4s`, `test-tq3-4s-sycl`, and
+`llama-server` succeeds. No toolchain installation is required.
+
+Ordinary op-offload initially crashed during model warmup, even with `-ngl 0`.
+The Windows exception stack identified a CPU SET copy writing a GPU address.
+Scheduler expansion could assign an in-place SET to CPU independently of its
+GPU-resident `view_src`. Split input copies did not change the output alias.
+Backend assignment now checks destination-buffer compatibility for aliases before
+splitting, and places SET on the destination's backend. An unsupported in-place
+operation on that backend fails explicitly instead of writing inaccessible memory.
+This leaves ordinary CPU/GPU transfers and TQ3_4S GPU offload enabled.
+
+The SYCL test now also executes a mixed scheduler graph with GPU TQ3_4S weights,
+a CPU update, in-place SET, and a strided CPU consumer. It checks placement,
+alias identity, numerical results, and unchanged persistent inputs over three
+executions, for 3 and 65 columns. Weights and inputs use external backend buffers:
+the allocator may reuse scheduler-owned INPUT storage after its last consumer,
+so an INPUT flag alone does not preserve data across executions. The earlier
+test fixture incorrectly assumed that it did; its second run consumed overwritten
+inputs. The fixed fixture does not restore inputs between runs or loosen tolerance.
+
+Validation on Intel Arc B580, Level Zero, driver 1.15.38308:
+
+- CPU and SYCL CTests both pass with `--repeat until-fail:3`, including the
+  mixed graph and the existing direct GPU matmul tests.
+- All seven Python math/source checks pass; exact CPU centroids are unchanged.
+- Full `Qwen3.8-27B-TQ3_4S-v2.gguf` smoke test passes with ordinary op-offload,
+  `-ngl 48 -c 512 -b 16 -ub 16 -np 1`. The 14-token prompt
+  `Explain in one sentence why the sky looks blue during the day.` produces
+  8 tokens: `\n\nThe sky appears blue during the day`.
+- The final request takes 6.625 seconds: prefill 4.24 tokens/s, decode
+  2.41 tokens/s. These are short smoke-test measurements, not steady-state benchmarks.
+- 48/66 layers are resident on GPU (9344.78 MiB of model tensors).
+  TQ3_4S matrices from CPU-resident layers also enter SYCL through op-offload.
+  `-ngl 0` with ordinary op-offload additionally passes model load and warmup.
+
+Set `GGML_SYCL_TQ3_TRACE=1` for compact dispatch evidence without the full SYCL
+debug log. After submitting native MMVQ, it reports device, matrix dimensions,
+weight name and separate single-/multi-column call counts at powers of two.
+The counters include warmup; the phase labels distinguish column counts, not
+server request boundaries. The successful smoke test records real model weights
+in both paths, including K=5120/17408 and ncols=1/10. Logging is off by default.
+
+Local evidence is in the ignored build directory: `build-final.log`,
+`test-final-repeat.log`, `final-smoke-ngl48.log`, and
+`final-smoke-ngl48-summary.json`.
+
+This remains a hybrid graph. Fused Gated Delta Net can still be disabled by
+the model's placement probe; its expanded graph now executes without the alias
+crash. Multi-column TQ3_4S still uses repeated GEMV, with CPU/GPU transfer and
+graph-splitting overhead. Long-context operation, MTP and sustained performance
+are not established by this short smoke test. Future work should measure these
+costs and reuse weight loads across columns; any int8 optimization must preserve
+the chosen codebook contract.
