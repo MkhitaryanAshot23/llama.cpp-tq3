@@ -59,7 +59,7 @@ static void bench_case(ggml_backend_t backend, int k, int rows, int warmup, int 
 
     const size_t nblocks = size_t(rows) * size_t(k) / 32;
     std::vector<block_tq3_4s> weights(nblocks);
-    std::vector<float> input(size_t(k));
+    std::vector<float> input(static_cast<size_t>(k));
     std::mt19937 rng(0x54493334u);
     std::normal_distribution<float> normal;
     for (auto & block : weights) {
