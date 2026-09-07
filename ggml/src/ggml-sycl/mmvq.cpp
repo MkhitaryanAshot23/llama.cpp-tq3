@@ -2135,6 +2135,104 @@ static void mul_mat_vec_tq3_4s_q8_1_sycl(
         });
 }
 
+template <int ncols_dst>
+static void mul_mat_vec_tq3_4s_q8_1_ncols(
+        const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+        const int ncols, const int nrows, const int stride_col_y, const int stride_col_dst,
+        const sycl::nd_item<3> & item) {
+    static_assert(ncols_dst >= 1 && ncols_dst <= 16);
+    const int row = item.get_group(2) * item.get_local_range(1) + item.get_local_id(1);
+    if (row >= nrows) {
+        return;
+    }
+
+    constexpr int qk = ggml_sycl_tq3_4s::qk;
+    constexpr int qi = ggml_sycl_tq3_4s::qi;
+    constexpr int vdr = ggml_sycl_tq3_4s::vdr;
+    constexpr int block_elements_per_warp = qi / vdr;
+    constexpr int blocks_per_warp = (vdr * WARP_SIZE + qi - 1) / qi;
+    const int blocks_per_row = ncols / qk;
+    const auto * x = static_cast<const block_tq3_4s *>(vx);
+    const auto * y = static_cast<const block_q8_1 *>(vy);
+    float sums[ncols_dst] = {0.0f};
+
+    for (int i = item.get_local_id(2) / block_elements_per_warp;
+         i < blocks_per_row; i += blocks_per_warp) {
+        const auto & block = x[row * blocks_per_row + i];
+        const int group = item.get_local_id(2) % block_elements_per_warp;
+        const uint32_t packed = ggml_sycl_tq3_4s::unpack_group(block.qs, group);
+        const float d = ggml_sycl_tq3_4s::scale(block.d[group]);
+
+        // Decode this weight group once, then reuse it across the column tile.
+        float weights[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            weights[k] = d * ggml_sycl_tq3_4s::centroid(ggml_sycl_tq3_4s::index(packed, k));
+        }
+
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const auto & activation = y[j * stride_col_y + i];
+            float dot = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                dot += weights[k] * float(activation.qs[8 * group + k]);
+            }
+            sums[j] += dot * float(activation.ds[0]);
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+        for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+            sums[j] += dpct::permute_sub_group_by_xor(item.get_sub_group(), sums[j], mask);
+        }
+        if (item.get_local_id(2) == 0) {
+            dst[j * stride_col_dst + row] = sums[j];
+        }
+    }
+}
+
+template <int ncols_dst>
+static void mul_mat_vec_tq3_4s_q8_1_sycl_ncols(
+        const void * vx, const void * vy, float * dst, const int ncols, const int nrows,
+        const int stride_col_y, const int stride_col_dst, dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % ggml_sycl_tq3_4s::qk == 0);
+    const sycl::range<3> blocks(1, 1, (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y);
+    const sycl::range<3> threads(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    stream->parallel_for(sycl::nd_range<3>(blocks * threads, threads),
+        [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            mul_mat_vec_tq3_4s_q8_1_ncols<ncols_dst>(
+                vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, item);
+        });
+}
+
+static void mul_mat_vec_tq3_4s_q8_1_sycl_switch_ncols(
+        const void * vx, const void * vy, float * dst, const int ncols, const int nrows,
+        const int ncols_dst, const int stride_col_y, const int stride_col_dst,
+        dpct::queue_ptr stream) {
+    switch (ncols_dst) {
+        case  1: mul_mat_vec_tq3_4s_q8_1_sycl       (vx, vy, dst, ncols, nrows, stream); break;
+        case  2: mul_mat_vec_tq3_4s_q8_1_sycl_ncols< 2>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case  3: mul_mat_vec_tq3_4s_q8_1_sycl_ncols< 3>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case  4: mul_mat_vec_tq3_4s_q8_1_sycl_ncols< 4>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case  5: mul_mat_vec_tq3_4s_q8_1_sycl_ncols< 5>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case  6: mul_mat_vec_tq3_4s_q8_1_sycl_ncols< 6>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case  7: mul_mat_vec_tq3_4s_q8_1_sycl_ncols< 7>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case  8: mul_mat_vec_tq3_4s_q8_1_sycl_ncols< 8>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case  9: mul_mat_vec_tq3_4s_q8_1_sycl_ncols< 9>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 10: mul_mat_vec_tq3_4s_q8_1_sycl_ncols<10>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 11: mul_mat_vec_tq3_4s_q8_1_sycl_ncols<11>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 12: mul_mat_vec_tq3_4s_q8_1_sycl_ncols<12>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 13: mul_mat_vec_tq3_4s_q8_1_sycl_ncols<13>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 14: mul_mat_vec_tq3_4s_q8_1_sycl_ncols<14>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 15: mul_mat_vec_tq3_4s_q8_1_sycl_ncols<15>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 16: mul_mat_vec_tq3_4s_q8_1_sycl_ncols<16>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        default: GGML_ABORT("unsupported ncols_dst=%d for TQ3_4S multi-column MMVQ", ncols_dst);
+    }
+}
+
 void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                                 ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
                                 const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low,
@@ -2153,15 +2251,26 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
     // the main device has a larger memory buffer to hold the results from all GPUs
     // nrows_dst == nrows of the matrix that the kernel writes into
 
+    if (src0->type == GGML_TYPE_TQ3_4S) {
+        constexpr int tile_cols = 16;
+        const int stride_col_y = src1_padded_col_size / QK8_1;
+        const int stride_col_dst = dst->ne[0];
+        for (int first_col = 0; first_col < src1_ncols; first_col += tile_cols) {
+            const int cols = std::min<int64_t>(tile_cols, src1_ncols - first_col);
+            mul_mat_vec_tq3_4s_q8_1_sycl_switch_ncols(
+                src0_dd_i,
+                static_cast<const block_q8_1 *>(static_cast<const void *>(src1_ddq_i)) + first_col * stride_col_y,
+                dst_dd_i + first_col * stride_col_dst,
+                ne00, row_diff, cols, stride_col_y, stride_col_dst, stream);
+        }
+        return;
+    }
+
     for (int i = 0; i < src1_ncols; i++) {
         const size_t src1_ddq_i_offset = i * src1_padded_col_size * q8_1_ts / q8_1_bs;
         const char * src1_ddq_i_bs     = src1_ddq_i + src1_ddq_i_offset;
         float *      dst_dd_i_bs       = dst_dd_i + i * dst->ne[0];
         switch (src0->type) {
-            case GGML_TYPE_TQ3_4S:
-                // One native GEMV per column, including batches larger than MMVQ_MAX_BATCH_SIZE.
-                mul_mat_vec_tq3_4s_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                break;
             case GGML_TYPE_Q4_0:
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                     ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
