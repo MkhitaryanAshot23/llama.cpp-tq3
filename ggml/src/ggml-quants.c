@@ -2851,6 +2851,24 @@ static inline uint8_t tq3_4s_encode_scale(float val) {
     return (uint8_t)((exp << 5) | m);
 }
 
+static inline float tq3_4s_group_sse(const float * values, uint8_t scale_byte) {
+    const float d = tq3_4s_decode_scale(scale_byte);
+    float sse = 0.0f;
+    if (d == 0.0f) {
+        for (int j = 0; j < 8; ++j) {
+            sse += values[j] * values[j];
+        }
+        return sse;
+    }
+    const float inv = 1.0f / d;
+    for (int j = 0; j < 8; ++j) {
+        const uint8_t idx = tq3_0_choose_index(values[j] * inv);
+        const float diff = values[j] - d * TQ3_0_CENTROIDS[idx];
+        sse += diff * diff;
+    }
+    return sse;
+}
+
 void quantize_row_tq3_4s_ref(const float * GGML_RESTRICT x, block_tq3_4s * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TQ3_0 == 0);
     const int64_t nb = k / QK_TQ3_0;
@@ -2878,9 +2896,33 @@ void quantize_row_tq3_4s_ref(const float * GGML_RESTRICT x, block_tq3_4s * GGML_
                 if (denom > 1e-12f) scale = fmaxf(numer / denom, 1e-10f);
             }
 
-            y[i].d[g] = tq3_4s_encode_scale(scale);
+            const uint8_t encoded_scale = tq3_4s_encode_scale(scale);
+            uint8_t best_scale_byte = encoded_scale;
 
-            // Keep indices from fp32 optimization — don't re-quantize
+            // Byte 0 is reserved for exact zero.  If a genuinely non-zero
+            // group underflows to it, compare exact-zero reconstruction with
+            // the minimum non-zero E3M5 code and keep the lower-SSE candidate.
+            if (encoded_scale == 0 && sum_sq > 0.0f) {
+                const float sse_zero = tq3_4s_group_sse(rotated + g * 8, 0);
+                const float sse_min  = tq3_4s_group_sse(rotated + g * 8, 1);
+                best_scale_byte = sse_min < sse_zero ? 1 : 0;
+            }
+
+            // Indices must match the scale that will actually be decoded, not
+            // the FP32 scale used during the refinement above.
+            const float actual_scale = tq3_4s_decode_scale(best_scale_byte);
+            if (actual_scale > 0.0f) {
+                const float inv = 1.0f / actual_scale;
+                for (int j = 0; j < 8; ++j) {
+                    all_idx[g * 8 + j] = tq3_0_choose_index(rotated[g * 8 + j] * inv);
+                }
+            } else {
+                for (int j = 0; j < 8; ++j) {
+                    all_idx[g * 8 + j] = tq3_0_choose_index(0.0f);
+                }
+            }
+            y[i].d[g] = best_scale_byte;
+
             uint8_t * idx = all_idx + g * 8;
             uint8_t * qp = y[i].qs + g * 3;
             qp[0] = (idx[0]) | (idx[1] << 3) | (idx[2] << 6);

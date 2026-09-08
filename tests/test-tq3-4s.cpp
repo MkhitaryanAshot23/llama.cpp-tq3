@@ -354,11 +354,106 @@ static void test_matmul(ggml_backend_t backend, std::mt19937 & rng, int k, int r
 }
 #endif
 
+
+static constexpr float encoder_centroids[8] = {
+    -1.996684f, -1.291398f, -0.740341f, -0.247508f,
+     0.230106f,  0.725222f,  1.277503f,  1.988943f,
+};
+
+static uint8_t encoder_choose_index(double x) {
+    int best = 0;
+    double best_error = std::abs(x - encoder_centroids[0]);
+    for (int i = 1; i < 8; ++i) {
+        const double error = std::abs(x - encoder_centroids[i]);
+        if (error < best_error) {
+            best = i;
+            best_error = error;
+        }
+    }
+    return uint8_t(best);
+}
+
+static std::array<uint8_t, 8> unpack_group_cpu(const block_tq3_4s & block, int g) {
+    const uint8_t * qp = block.qs + g * 3;
+    return {
+        uint8_t( qp[0]       & 7),
+        uint8_t((qp[0] >> 3) & 7),
+        uint8_t(((qp[0] >> 6) | (qp[1] << 2)) & 7),
+        uint8_t((qp[1] >> 1) & 7),
+        uint8_t((qp[1] >> 4) & 7),
+        uint8_t(((qp[1] >> 7) | (qp[2] << 1)) & 7),
+        uint8_t((qp[2] >> 2) & 7),
+        uint8_t((qp[2] >> 5) & 7),
+    };
+}
+
+static double encoder_group_sse(const std::array<double, 32> & rotated, int g, uint8_t scale_byte,
+                                std::array<uint8_t, 8> * indices = nullptr) {
+    const double d = tq::scale(scale_byte);
+    double sse = 0.0;
+    for (int j = 0; j < 8; ++j) {
+        const double value = rotated[g * 8 + j];
+        const uint8_t idx = d == 0.0 ? encoder_choose_index(0.0) : encoder_choose_index(value / d);
+        if (indices) {
+            (*indices)[j] = idx;
+        }
+        const double diff = value - d * encoder_centroids[idx];
+        sse += diff * diff;
+    }
+    return sse;
+}
+
+static void test_e3m5_encoder_underflow() {
+    float zero[32] = {};
+    block_tq3_4s zero_block{};
+    quantize_row_tq3_4s_ref(zero, &zero_block, 32);
+    for (uint8_t d : zero_block.d) {
+        check(d == 0, "true zero remains E3M5 byte 0");
+    }
+
+    float input[32];
+    for (int i = 0; i < 32; ++i) {
+        input[i] = 1.0e-4f * ((i & 1) ? 1.0f : -1.0f) * (1.0f + 0.03125f * i);
+    }
+    block_tq3_4s block{};
+    quantize_row_tq3_4s_ref(input, &block, 32);
+    const auto rotated = rotate(input);
+
+    bool saw_underflow_group = false;
+    for (int g = 0; g < 4; ++g) {
+        double energy = 0.0;
+        for (int j = 0; j < 8; ++j) {
+            energy += rotated[g * 8 + j] * rotated[g * 8 + j];
+        }
+        if (energy == 0.0) {
+            continue;
+        }
+        check(block.d[g] == 0 || block.d[g] == 1, "small non-zero group must choose zero or minimum E3M5 scale");
+        saw_underflow_group = true;
+
+        std::array<uint8_t, 8> zero_idx{}, min_idx{};
+        const double sse_zero = encoder_group_sse(rotated, g, 0, &zero_idx);
+        const double sse_min  = encoder_group_sse(rotated, g, 1, &min_idx);
+        const uint8_t expected_byte = sse_min < sse_zero ? 1 : 0;
+        const auto & expected_idx = expected_byte == 1 ? min_idx : zero_idx;
+        check(block.d[g] == expected_byte, "underflow candidate must minimize reconstruction SSE");
+
+        const auto stored_idx = unpack_group_cpu(block, g);
+        check(stored_idx == expected_idx, "stored indices must match the decoded chosen scale");
+
+        const double chosen_sse = encoder_group_sse(rotated, g, block.d[g]);
+        const double alternative_sse = encoder_group_sse(rotated, g, block.d[g] == 0 ? 1 : 0);
+        check(chosen_sse <= alternative_sse + 1e-14, "chosen underflow candidate SSE must not exceed alternative");
+    }
+    check(saw_underflow_group, "regression input must exercise non-zero E3M5 underflow");
+}
+
 int main(int argc, char ** argv) {
     auto * init = ggml_init({ggml_tensor_overhead(), nullptr, true});
     check(init != nullptr, "ggml initialization");
     ggml_free(init);
     test_format();
+    test_e3m5_encoder_underflow();
     for (unsigned seed : {1u, 42u, 2026u, 0xdeadbeefu}) {
         std::mt19937 rng(seed);
         std::normal_distribution<float> normal;
