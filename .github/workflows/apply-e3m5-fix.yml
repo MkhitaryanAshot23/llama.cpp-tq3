@@ -1,0 +1,218 @@
+name: Apply TQ3 E3M5 encoder fix
+
+on:
+  push:
+    branches: [tq3-e3m5-encoder-fix]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tq3-e3m5-encoder-fix
+          fetch-depth: 0
+
+      - name: Apply encoder and regression-test changes
+        shell: python
+        run: |
+          from pathlib import Path
+
+          quants = Path('ggml/src/ggml-quants.c')
+          text = quants.read_text()
+
+          anchor = '''static inline uint8_t tq3_4s_encode_scale(float val) {
+              if (val <= 0.0f) return 0;
+              const int exp_raw = (int)floorf(log2f(val));
+              int exp = exp_raw + 9;
+              if (exp < 0) exp = 0;
+              if (exp > 7) exp = 7;
+              const float mantissa = val / ldexpf(1.0f, exp - 9) - 1.0f;
+              int m = (int)roundf(mantissa * 32.0f);
+              if (m < 0) m = 0;
+              if (m > 31) m = 31;
+              return (uint8_t)((exp << 5) | m);
+          }
+          '''
+          helper = anchor + '''
+          static inline float tq3_4s_group_sse(const float * values, uint8_t scale_byte) {
+              const float d = tq3_4s_decode_scale(scale_byte);
+              float sse = 0.0f;
+              if (d == 0.0f) {
+                  for (int j = 0; j < 8; ++j) {
+                      sse += values[j] * values[j];
+                  }
+                  return sse;
+              }
+              const float inv = 1.0f / d;
+              for (int j = 0; j < 8; ++j) {
+                  const uint8_t idx = tq3_0_choose_index(values[j] * inv);
+                  const float diff = values[j] - d * TQ3_0_CENTROIDS[idx];
+                  sse += diff * diff;
+              }
+              return sse;
+          }
+          '''
+          if anchor not in text:
+              raise SystemExit('encode-scale anchor not found')
+          text = text.replace(anchor, helper, 1)
+
+          old = '''            y[i].d[g] = tq3_4s_encode_scale(scale);
+
+                      // Keep indices from fp32 optimization — don't re-quantize
+                      uint8_t * idx = all_idx + g * 8;
+          '''
+          new = '''            const uint8_t encoded_scale = tq3_4s_encode_scale(scale);
+                      uint8_t best_scale_byte = encoded_scale;
+
+                      // Byte 0 is reserved for exact zero.  If a genuinely non-zero
+                      // group underflows to it, compare exact-zero reconstruction with
+                      // the minimum non-zero E3M5 code and keep the lower-SSE candidate.
+                      if (encoded_scale == 0 && sum_sq > 0.0f) {
+                          const float sse_zero = tq3_4s_group_sse(rotated + g * 8, 0);
+                          const float sse_min  = tq3_4s_group_sse(rotated + g * 8, 1);
+                          best_scale_byte = sse_min < sse_zero ? 1 : 0;
+                      }
+
+                      // Indices must match the scale that will actually be decoded, not
+                      // the FP32 scale used during the refinement above.
+                      const float actual_scale = tq3_4s_decode_scale(best_scale_byte);
+                      if (actual_scale > 0.0f) {
+                          const float inv = 1.0f / actual_scale;
+                          for (int j = 0; j < 8; ++j) {
+                              all_idx[g * 8 + j] = tq3_0_choose_index(rotated[g * 8 + j] * inv);
+                          }
+                      } else {
+                          for (int j = 0; j < 8; ++j) {
+                              all_idx[g * 8 + j] = tq3_0_choose_index(0.0f);
+                          }
+                      }
+                      y[i].d[g] = best_scale_byte;
+
+                      uint8_t * idx = all_idx + g * 8;
+          '''
+          if old not in text:
+              raise SystemExit('quantizer anchor not found')
+          quants.write_text(text.replace(old, new, 1))
+
+          test = Path('tests/test-tq3-4s.cpp')
+          text = test.read_text()
+          main_anchor = 'int main(int argc, char ** argv) {'
+          if main_anchor not in text:
+              raise SystemExit('test main anchor not found')
+
+          regression = r'''
+          static constexpr float encoder_centroids[8] = {
+              -1.996684f, -1.291398f, -0.740341f, -0.247508f,
+               0.230106f,  0.725222f,  1.277503f,  1.988943f,
+          };
+
+          static uint8_t encoder_choose_index(double x) {
+              int best = 0;
+              double best_error = std::abs(x - encoder_centroids[0]);
+              for (int i = 1; i < 8; ++i) {
+                  const double error = std::abs(x - encoder_centroids[i]);
+                  if (error < best_error) {
+                      best = i;
+                      best_error = error;
+                  }
+              }
+              return uint8_t(best);
+          }
+
+          static std::array<uint8_t, 8> unpack_group_cpu(const block_tq3_4s & block, int g) {
+              const uint8_t * qp = block.qs + g * 3;
+              return {
+                  uint8_t( qp[0]       & 7),
+                  uint8_t((qp[0] >> 3) & 7),
+                  uint8_t(((qp[0] >> 6) | (qp[1] << 2)) & 7),
+                  uint8_t((qp[1] >> 1) & 7),
+                  uint8_t((qp[1] >> 4) & 7),
+                  uint8_t(((qp[1] >> 7) | (qp[2] << 1)) & 7),
+                  uint8_t((qp[2] >> 2) & 7),
+                  uint8_t((qp[2] >> 5) & 7),
+              };
+          }
+
+          static double encoder_group_sse(const std::array<double, 32> & rotated, int g, uint8_t scale_byte,
+                                          std::array<uint8_t, 8> * indices = nullptr) {
+              const double d = tq::scale(scale_byte);
+              double sse = 0.0;
+              for (int j = 0; j < 8; ++j) {
+                  const double value = rotated[g * 8 + j];
+                  const uint8_t idx = d == 0.0 ? encoder_choose_index(0.0) : encoder_choose_index(value / d);
+                  if (indices) {
+                      (*indices)[j] = idx;
+                  }
+                  const double diff = value - d * encoder_centroids[idx];
+                  sse += diff * diff;
+              }
+              return sse;
+          }
+
+          static void test_e3m5_encoder_underflow() {
+              float zero[32] = {};
+              block_tq3_4s zero_block{};
+              quantize_row_tq3_4s_ref(zero, &zero_block, 32);
+              for (uint8_t d : zero_block.d) {
+                  check(d == 0, "true zero remains E3M5 byte 0");
+              }
+
+              float input[32];
+              for (int i = 0; i < 32; ++i) {
+                  input[i] = 1.0e-4f * ((i & 1) ? 1.0f : -1.0f) * (1.0f + 0.03125f * i);
+              }
+              block_tq3_4s block{};
+              quantize_row_tq3_4s_ref(input, &block, 32);
+              const auto rotated = rotate(input);
+
+              bool saw_underflow_group = false;
+              for (int g = 0; g < 4; ++g) {
+                  double energy = 0.0;
+                  for (int j = 0; j < 8; ++j) {
+                      energy += rotated[g * 8 + j] * rotated[g * 8 + j];
+                  }
+                  if (energy == 0.0) {
+                      continue;
+                  }
+                  check(block.d[g] == 0 || block.d[g] == 1, "small non-zero group must choose zero or minimum E3M5 scale");
+                  saw_underflow_group = true;
+
+                  std::array<uint8_t, 8> zero_idx{}, min_idx{};
+                  const double sse_zero = encoder_group_sse(rotated, g, 0, &zero_idx);
+                  const double sse_min  = encoder_group_sse(rotated, g, 1, &min_idx);
+                  const uint8_t expected_byte = sse_min < sse_zero ? 1 : 0;
+                  const auto & expected_idx = expected_byte == 1 ? min_idx : zero_idx;
+                  check(block.d[g] == expected_byte, "underflow candidate must minimize reconstruction SSE");
+
+                  const auto stored_idx = unpack_group_cpu(block, g);
+                  check(stored_idx == expected_idx, "stored indices must match the decoded chosen scale");
+
+                  const double chosen_sse = encoder_group_sse(rotated, g, block.d[g]);
+                  const double alternative_sse = encoder_group_sse(rotated, g, block.d[g] == 0 ? 1 : 0);
+                  check(chosen_sse <= alternative_sse + 1e-14, "chosen underflow candidate SSE must not exceed alternative");
+              }
+              check(saw_underflow_group, "regression input must exercise non-zero E3M5 underflow");
+          }
+
+          '''
+          text = text.replace(main_anchor, regression + main_anchor, 1)
+          call_anchor = '    test_format();\n'
+          if call_anchor not in text:
+              raise SystemExit('test call anchor not found')
+          text = text.replace(call_anchor, call_anchor + '    test_e3m5_encoder_underflow();\n', 1)
+          test.write_text(text)
+
+          Path('.github/workflows/apply-e3m5-fix.yml').unlink()
+
+      - name: Commit fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ggml/src/ggml-quants.c tests/test-tq3-4s.cpp .github/workflows/apply-e3m5-fix.yml
+          git commit -m "Fix TQ3 E3M5 encoder underflow"
+          git push origin HEAD:tq3-e3m5-encoder-fix
