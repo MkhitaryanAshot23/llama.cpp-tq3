@@ -2851,6 +2851,50 @@ static inline uint8_t tq3_4s_encode_scale(float val) {
     return (uint8_t)((exp << 5) | m);
 }
 
+// Select indices for the scale which will actually be stored in the block.
+// Byte zero is an exact zero sentinel, not the lowest E3M5 number.
+static float tq3_4s_select_indices(
+        const float * x, const float * weights, float scale, uint8_t * indices) {
+    float error = 0.0f;
+    if (scale == 0.0f) {
+        for (int j = 0; j < 8; ++j) {
+            indices[j] = 0;
+            error += (weights ? weights[j] : 1.0f) * x[j] * x[j];
+        }
+        return error;
+    }
+
+    const float inv = 1.0f / scale;
+    for (int j = 0; j < 8; ++j) {
+        const uint8_t idx = tq3_0_choose_index(x[j] * inv);
+        const float diff = x[j] - scale * TQ3_0_CENTROIDS[idx];
+        indices[j] = idx;
+        error += (weights ? weights[j] : 1.0f) * diff * diff;
+    }
+    return error;
+}
+
+static uint8_t tq3_4s_finalize_scale(
+        const float * x, const float * weights, float scale, uint8_t * indices) {
+    uint8_t encoded = tq3_4s_encode_scale(scale);
+    if (encoded != 0 || scale == 0.0f) {
+        tq3_4s_select_indices(x, weights, tq3_4s_decode_scale(encoded), indices);
+        return encoded;
+    }
+
+    // A positive scale underflowed to the zero sentinel. Compare exact zero to
+    // the smallest representable nonzero E3M5 scale before discarding the group.
+    uint8_t min_indices[8];
+    const float zero_error = tq3_4s_select_indices(x, weights, 0.0f, indices);
+    const float min_error = tq3_4s_select_indices(
+        x, weights, tq3_4s_decode_scale(1), min_indices);
+    if (min_error < zero_error) {
+        memcpy(indices, min_indices, sizeof(min_indices));
+        return 1;
+    }
+    return 0;
+}
+
 void quantize_row_tq3_4s_ref(const float * GGML_RESTRICT x, block_tq3_4s * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TQ3_0 == 0);
     const int64_t nb = k / QK_TQ3_0;
@@ -2878,10 +2922,8 @@ void quantize_row_tq3_4s_ref(const float * GGML_RESTRICT x, block_tq3_4s * GGML_
                 if (denom > 1e-12f) scale = fmaxf(numer / denom, 1e-10f);
             }
 
-            y[i].d[g] = tq3_4s_encode_scale(scale);
-
-            // Keep indices from fp32 optimization — don't re-quantize
             uint8_t * idx = all_idx + g * 8;
+            y[i].d[g] = tq3_4s_finalize_scale(rotated + g * 8, NULL, scale, idx);
             uint8_t * qp = y[i].qs + g * 3;
             qp[0] = (idx[0]) | (idx[1] << 3) | (idx[2] << 6);
             qp[1] = (idx[2] >> 2) | (idx[3] << 1) | (idx[4] << 4) | (idx[5] << 7);
@@ -3312,9 +3354,9 @@ size_t quantize_tq3_4s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
                     if (denom > 1e-12f) scale = fmaxf(numer / denom, 1e-10f);
                 }
 
-                y[row * nb + i].d[g] = tq3_4s_encode_scale(scale);
-
                 uint8_t * idx = all_idx + g * 8;
+                y[row * nb + i].d[g] = tq3_4s_finalize_scale(
+                    rotated + g * 8, w_per_elem, scale, idx);
                 uint8_t * qp = y[row * nb + i].qs + g * 3;
                 qp[0] = (idx[0]) | (idx[1] << 3) | (idx[2] << 6);
                 qp[1] = (idx[2] >> 2) | (idx[3] << 1) | (idx[4] << 4) | (idx[5] << 7);

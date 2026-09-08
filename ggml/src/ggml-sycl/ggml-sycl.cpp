@@ -5380,25 +5380,25 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend,
-                                               const ggml_tensor *src,
-                                               ggml_tensor *dst) try {
-    ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
-    bool is_cpy_supported                = dst->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) &&
-                            ggml_backend_buffer_is_sycl(src->buffer);
+static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend_src,
+                                              ggml_backend_t backend_dst,
+                                              const ggml_tensor * src,
+                                              ggml_tensor * dst) try {
+    ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *) backend_dst->context;
+    const bool is_cpy_supported =
+        dst->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) &&
+        ggml_backend_buffer_is_host(src->buffer);
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": dst", dst).c_str());
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(" src", src).c_str());
     GGML_SYCL_DEBUG(" is_cpy_supported=%d\n", is_cpy_supported);
     if (is_cpy_supported) {
-        /*
-        DPCT1009:215: SYCL uses exceptions to report errors and does not use the
-        error codes. The original code was commented out and a warning string
-        was inserted. You need to rewrite this code.
-        */
+        // Complete the host producer before reading its storage. The in-order
+        // destination queue orders the copy before its consumers without a host wait.
+        // Device-to-device copies retain the existing synchronized buffer path.
+        ggml_backend_synchronize(backend_src);
         const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
-        SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy(
-            dst->data, src->data, ggml_nbytes(dst))));
+        SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(dst->data, src->data, ggml_nbytes(dst))));
         return true;
     }
 
@@ -5596,9 +5596,7 @@ static ggml_backend_i ggml_backend_sycl_interface = {
     /* .get_tensor_async        = */ ggml_backend_sycl_get_tensor_async,
     /* .set_tensor_2d_async     = */ NULL,
     /* .get_tensor_2d_async     = */ NULL,
-    /* .cpy_tensor_async        = */ NULL, // ggml_backend_sycl_cpy_tensor_async,
-                                           // // TODO: update for the new
-                                           // interface
+    /* .cpy_tensor_async        = */ ggml_backend_sycl_cpy_tensor_async,
     /* .synchronize             = */ ggml_backend_sycl_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,

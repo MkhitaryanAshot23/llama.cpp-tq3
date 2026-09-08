@@ -125,7 +125,11 @@ class TQ3Math(unittest.TestCase):
         self.assertIn("op->op == GGML_OP_MUL_MAT", support)
         self.assertIn("quantize_row_q8_1_sycl<quantize_tq3_4s_q8_1>", backend)
         mmvq = (ROOT / "ggml/src/ggml-sycl/mmvq.cpp").read_text(encoding="utf-8")
-        self.assertIn("case GGML_TYPE_TQ3_4S:", mmvq)
+        dispatch = mmvq[mmvq.index("if (src0->type == GGML_TYPE_TQ3_4S)"):]
+        dispatch = dispatch[:dispatch.index("return;")]
+        self.assertIn("constexpr int tile_cols = 16;", dispatch)
+        self.assertIn("first_col += tile_cols", dispatch)
+        self.assertIn("mul_mat_vec_tq3_4s_q8_1_sycl_switch_ncols(", dispatch)
         kernel = mmvq[mmvq.index("static void mul_mat_vec_tq3_4s_q8_1_sycl"):]
         self.assertIn("[[sycl::reqd_sub_group_size(WARP_SIZE)]]", kernel)
         self.assertIn("ggml_sycl_tq3_4s::vdr, vec_dot_tq3_4s_q8_1>", kernel)

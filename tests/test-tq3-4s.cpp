@@ -3,16 +3,20 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-quants.h"
+#include "gguf.h"
 #include "ggml-sycl/tq3_4s.hpp"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <random>
+#include <set>
 #include <vector>
 
 namespace tq = ggml_sycl_tq3_4s;
@@ -69,9 +73,50 @@ static void pack(block_tq3_4s & block, const std::array<uint8_t, 32> & indices) 
     }
 }
 
+static void test_encoder_underflow() {
+    // Mistral contains groups with RMS below E3M5's smallest nonzero scale.
+    // Encoding a clamped exponent/mantissa as byte zero used to erase them.
+    for (float amplitude : {0.0008f, 0.0012f, 0.0016f}) {
+        std::array<float, 32> x{}, decoded{}, importance;
+        importance.fill(1.0f);
+        for (int j = 0; j < 32; ++j) {
+            for (int i = 0; i < 32; ++i) {
+                const float rotated = (i % 2 ? -1.0f : 1.0f) * amplitude;
+                x[j] += float(hadamard(i, j)) * ref_signs[j] * rotated / std::sqrt(32.0f);
+            }
+        }
+        for (bool weighted : {false, true}) {
+            block_tq3_4s w{};
+            quantize_tq3_4s(x.data(), &w, 1, 32, weighted ? importance.data() : nullptr);
+            for (uint8_t d : w.d) {
+                check(d != 0, "representable low-amplitude group must not be erased");
+            }
+            dequantize_row_tq3_4s(&w, decoded.data(), 32);
+            double error = 0, energy = 0;
+            for (int i = 0; i < 32; ++i) {
+                error += std::pow(double(decoded[i]) - x[i], 2);
+                energy += double(x[i]) * x[i];
+            }
+            check(error < 0.25 * energy, "refit indices to the minimum nonzero scale");
+        }
+    }
+    std::array<float, 32> tiny{};
+    tiny.fill(1e-8f);
+    block_tq3_4s w{};
+    quantize_row_tq3_4s_ref(tiny.data(), &w, 32);
+    for (uint8_t d : w.d) {
+        check(d == 0, "retain zero when it minimizes underflow error");
+    }
+}
+
 static void test_format() {
     check(GGML_TYPE_TQ3_4S != GGML_TYPE_TQ3_0, "distinct weight formats");
     check(ggml_blck_size(GGML_TYPE_TQ3_4S) == 32 && sizeof(block_tq3_4s) == 16, "block layout");
+    for (uint8_t i = 0; i < 8; ++i) {
+        const float table = tq::centroid(i);
+        const float decode = tq::centroid_decode(i);
+        check(std::memcmp(&table, &decode, sizeof(float)) == 0, "decode codebook must be bit-exact");
+    }
     for (int d = 0; d < 256; ++d) {
         const float expected = d == 0 ? 0.0f : std::ldexp(1.0f + (d & 31) / 32.0f, (d >> 5) - 9);
         close(tq::scale(d), expected, 0, "all E3M5 encodings");
@@ -295,7 +340,8 @@ static void test_capabilities(ggml_backend_t backend) {
     ggml_free(ctx);
 }
 
-static void test_matmul(ggml_backend_t backend, std::mt19937 & rng, int k, int rows, int cols, bool strided) {
+static void test_matmul(ggml_backend_t backend, std::mt19937 & rng, int k, int rows, int cols, bool strided,
+                        const std::vector<block_tq3_4s> * file_weights = nullptr) {
     ggml_context * ctx = ggml_init({ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true});
     check(ctx != nullptr, "context allocation");
     auto * w = ggml_new_tensor_2d(ctx, GGML_TYPE_TQ3_4S, k, rows);
@@ -313,7 +359,12 @@ static void test_matmul(ggml_backend_t backend, std::mt19937 & rng, int k, int r
     auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     check(buffer != nullptr, "GPU buffer allocation");
     std::vector<block_tq3_4s> weights(size_t(rows) * k / 32);
-    random_weights(rng, weights);
+    if (file_weights) {
+        check(file_weights->size() == weights.size(), "GGUF weight shape");
+        weights = *file_weights;
+    } else {
+        random_weights(rng, weights);
+    }
     std::vector<float> input(size_t(pitch) * cols, -12345.0f);
     std::normal_distribution<float> normal;
     for (int c = 0; c < cols; ++c) {
@@ -338,6 +389,12 @@ static void test_matmul(ggml_backend_t backend, std::mt19937 & rng, int k, int r
     ggml_backend_tensor_get(y, output.data(), 0, output.size() * sizeof(float));
     for (int c = 0; c < cols; ++c) {
         for (int row = 0; row < rows; ++row) {
+            // Real GGUF matrices execute at their full shape; sample CPU reference
+            // rows at lane/group boundaries, the midpoint and the final two rows.
+            // The model-free tests continue to check every output element.
+            if (file_weights && row > 16 && row != rows/2 && row < rows-2) {
+                continue;
+            }
             const auto ref = reference_dot(weights.data() + size_t(row) * k / 32,
                                            input.data() + size_t(c) * pitch + offset, k);
             const double tol = 2e-5 * std::max(1.0, ref.magnitude);
@@ -352,6 +409,80 @@ static void test_matmul(ggml_backend_t backend, std::mt19937 & rng, int k, int r
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
 }
+
+static void test_gguf(ggml_backend_t backend, const char * path) {
+    ggml_context * metadata = nullptr;
+    auto * gguf = gguf_init_from_file(path, {true, &metadata});
+    check(gguf && metadata, "GGUF metadata");
+    std::ifstream input(path, std::ios::binary);
+    check(bool(input), "GGUF input");
+    std::set<std::pair<int64_t, int64_t>> shapes;
+    std::mt19937 rng(614416384);
+    for (int64_t i = 0; i < gguf_get_n_tensors(gguf); ++i) {
+        const char * name = gguf_get_tensor_name(gguf, i);
+        const auto * tensor = ggml_get_tensor(metadata, name);
+        if (tensor->type != GGML_TYPE_TQ3_4S || tensor->ne[2] != 1 || tensor->ne[3] != 1 ||
+            !shapes.insert({tensor->ne[0], tensor->ne[1]}).second) {
+            continue;
+        }
+        std::vector<block_tq3_4s> weights(ggml_nbytes(tensor) / sizeof(block_tq3_4s));
+        input.seekg(gguf_get_data_offset(gguf) + gguf_get_tensor_offset(gguf, i));
+        input.read(reinterpret_cast<char *>(weights.data()), ggml_nbytes(tensor));
+        check(bool(input), "GGUF tensor payload");
+        std::printf("GGUF reference tensor=%s K=%lld rows=%lld\n", name,
+                    (long long) tensor->ne[0], (long long) tensor->ne[1]);
+        for (int cols : {1, 3, 16, 17}) {
+            test_matmul(backend, rng, int(tensor->ne[0]), int(tensor->ne[1]), cols, cols == 17, &weights);
+        }
+    }
+    check(!shapes.empty(), "GGUF has TQ3_4S matrices");
+    gguf_free(gguf);
+    ggml_free(metadata);
+}
+
+static void benchmark_decode(ggml_backend_t backend, int k, int rows, int nodes,
+                             const std::vector<block_tq3_4s> * payload = nullptr) {
+    // Controlled uniform payload for comparison with the original microbenchmark.
+    // Timing includes RHT, Q8 quantization and dispatch, but excludes transfers and JIT.
+    // Effective weight bandwidth here is not a measurement of full-model throughput.
+    ggml_context * ctx = ggml_init({
+        ggml_tensor_overhead() * size_t(nodes + 2) + ggml_graph_overhead_custom(nodes + 8, false), nullptr, true });
+    check(ctx != nullptr, "benchmark context allocation");
+    auto * w = ggml_new_tensor_2d(ctx, GGML_TYPE_TQ3_4S, k, rows);
+    auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+    auto * graph = ggml_new_graph_custom(ctx, nodes + 8, false);
+    for (int i = 0; i < nodes; ++i) {
+        auto * y = ggml_mul_mat(ctx, w, x);
+        ggml_build_forward_expand(graph, y);
+    }
+    auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    check(buffer != nullptr, "benchmark GPU buffer allocation");
+    std::vector<uint8_t> weights;
+    if (payload) {
+        check(payload->size() * sizeof(block_tq3_4s) == ggml_nbytes(w), "benchmark payload dimensions");
+    } else {
+        weights.assign(ggml_nbytes(w), 0x55);
+    }
+    std::vector<float> input(k, 0.125f);
+    const void * weight_data = payload ? static_cast<const void *>(payload->data())
+                                       : static_cast<const void *>(weights.data());
+    ggml_backend_tensor_set(w, weight_data, 0, ggml_nbytes(w));
+    ggml_backend_tensor_set(x, input.data(), 0, input.size() * sizeof(float));
+    check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "benchmark warmup");
+    constexpr int repeats = 8;
+    const auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < repeats; ++i) {
+        check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "benchmark compute");
+    }
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    const double ops = double(nodes) * repeats;
+    const double gb = double(ggml_nbytes(w)) * ops / 1e9;
+    std::printf("BENCH k=%d rows=%d nodes=%d: %.3f ms/op, %.2f GB/s\n",
+                k, rows, nodes, 1000.0 * seconds / ops, gb / seconds);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+}
+
 #endif
 
 int main(int argc, char ** argv) {
@@ -359,6 +490,7 @@ int main(int argc, char ** argv) {
     check(init != nullptr, "ggml initialization");
     ggml_free(init);
     test_format();
+    test_encoder_underflow();
     for (unsigned seed : {1u, 42u, 2026u, 0xdeadbeefu}) {
         std::mt19937 rng(seed);
         std::normal_distribution<float> normal;
@@ -385,7 +517,8 @@ int main(int argc, char ** argv) {
         for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
             auto candidate = ggml_backend_reg_dev_get(reg, i);
             if (ggml_backend_dev_type(candidate) == GGML_BACKEND_DEVICE_TYPE_GPU &&
-                (argc < 2 || std::strcmp(argv[1], ggml_backend_dev_name(candidate)) == 0)) {
+                (argc < 2 || std::strcmp(argv[1], "--bench") == 0 || std::strcmp(argv[1], "--gguf") == 0 ||
+                 std::strcmp(argv[1], ggml_backend_dev_name(candidate)) == 0)) {
                 device = candidate;
                 break;
             }
@@ -398,9 +531,29 @@ int main(int argc, char ** argv) {
     auto backend = ggml_backend_dev_init(device, nullptr);
     check(backend != nullptr, "SYCL backend initialization");
     std::printf("Testing %s: %s\n", ggml_backend_dev_name(device), ggml_backend_dev_description(device));
+    if (argc >= 2 && std::strcmp(argv[1], "--gguf") == 0) {
+        check(argc == 3, "usage: test-tq3-4s-sycl --gguf model.gguf");
+        test_gguf(backend, argv[2]);
+        ggml_backend_free(backend);
+        return 0;
+    }
+    if (argc >= 2 && std::strcmp(argv[1], "--bench") == 0) {
+        benchmark_decode(backend, 5120, 1, 256);
+        benchmark_decode(backend, 17408, 1, 256);
+        benchmark_decode(backend, 5120, 17408, 32);
+        benchmark_decode(backend, 17408, 5120, 32);
+        benchmark_decode(backend, 5120, 5120, 64);
+        ggml_backend_free(backend);
+        return 0;
+    }
     test_capabilities(backend);
     test_scheduler(backend, 3);
     test_scheduler(backend, 65);
+    std::mt19937 tile_rng(92341);
+    for (int cols : {16, 17, 31, 32}) {
+        test_matmul(backend, tile_rng, 544, 17, cols, false);
+        test_matmul(backend, tile_rng, 544, 17, cols, true);
+    }
     for (unsigned seed : {1u, 42u, 2026u, 0xdeadbeefu}) {
         std::mt19937 rng(seed);
         for (int k : {32, 96, 256, 544, 4096}) {
