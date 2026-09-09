@@ -1,0 +1,62 @@
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@
+-static void mul_mat_vec_tq3_4s_q8_1_sycl(
++static void mul_mat_vec_tq3_4s_q8_1_launch16(
++        const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
++        const int ncols, const int nrows, const sycl::nd_item<3> & item) {
++    const auto sg = item.get_sub_group();
++    const int row = item.get_group_linear_id() * sg.get_group_linear_range() + sg.get_group_linear_id();
++
++    if (row >= nrows) {
++        return;
++    }
++
++    constexpr int qk  = ggml_sycl_tq3_4s::qk;
++    constexpr int qi  = ggml_sycl_tq3_4s::qi;
++    constexpr int vdr = ggml_sycl_tq3_4s::vdr;
++    constexpr int blocks_per_warp = (vdr * WARP_SIZE + qi - 1) / qi;
++
++    const int blocks_per_row = ncols / qk;
++    const auto * x = static_cast<const block_tq3_4s *>(vx);
++    const auto * y = static_cast<const block_q8_1 *>(vy);
++    float tmp = 0.0f;
++
++    for (int i = sg.get_local_linear_id() / (qi / vdr); i < blocks_per_row; i += blocks_per_warp) {
++        const int ibx = row * blocks_per_row + i;
++        const int iby = i * (qk / QK8_1);
++
++        for (size_t elem = 0; elem < qi / vdr; elem += WARP_SIZE) {
++            const int iqs = elem + vdr * (sg.get_local_linear_id() % (qi / vdr));
++            tmp += vec_dot_tq3_4s_q8_1(&x[ibx], &y[iby], iqs);
++        }
++    }
++
++#pragma unroll
++    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
++        tmp += dpct::permute_sub_group_by_xor(sg, tmp, mask);
++    }
++
++    if (sg.get_local_linear_id() == 0) {
++        dst[row] = tmp;
++    }
++}
++
++static void mul_mat_vec_tq3_4s_q8_1_sycl(
+         const void * vx, const void * vy, float * dst, const int ncols, const int nrows,
+         dpct::queue_ptr stream) {
+     GGML_ASSERT(ncols % ggml_sycl_tq3_4s::qk == 0);
+-    const sycl::range<3> blocks(1, 1, (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y);
+-    const sycl::range<3> threads(1, GGML_SYCL_MMV_Y, WARP_SIZE);
++    constexpr size_t num_subgroups = WARP_SIZE;
++    const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
++    const sycl::range<3> blocks(1, 1, block_num_y);
++    const sycl::range<3> threads(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+     stream->parallel_for(sycl::nd_range<3>(blocks * threads, threads),
+         [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+-            mul_mat_vec_q<ggml_sycl_tq3_4s::qk, ggml_sycl_tq3_4s::qi, block_tq3_4s,
+-                          ggml_sycl_tq3_4s::vdr, vec_dot_tq3_4s_q8_1>(vx, vy, dst, ncols, nrows, item);
++            mul_mat_vec_tq3_4s_q8_1_launch16(vx, vy, dst, ncols, nrows, item);
+         });
+ }
